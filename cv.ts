@@ -1,11 +1,6 @@
 import * as cv from "opencv4nodejs";
 
-export async function cropFeatheredStickers(
-  url: string,
-  gridRows = 3,
-  gridCols = 3,
-  featherPx = 10
-) {
+export async function cropFeatheredStickers(url: string, featherPx = 10) {
   const req = await fetch(url);
   const buffer = await req.arrayBuffer();
   let img = cv.imdecode(Buffer.from(buffer), cv.IMREAD_UNCHANGED);
@@ -30,19 +25,20 @@ export async function cropFeatheredStickers(
     cv.MORPH_OPEN
   );
   const contours = clean.findContours(cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE);
+  const size = contours.length > 6 ? 3 : 2;
 
   // grid-cluster contours
-  const cellW = Math.floor(img.cols / gridCols);
-  const cellH = Math.floor(img.rows / gridRows);
-  const cells: cv.Contour[][] = Array(gridRows * gridCols)
+  const cellW = Math.floor(img.cols / size);
+  const cellH = Math.floor(img.rows / size);
+  const cells: cv.Contour[][] = Array(size ** 2)
     .fill(0)
     .map(() => []);
 
   contours.forEach((c) => {
     const { x, y, width, height } = c.boundingRect();
-    const col = Math.min(Math.floor((x + width / 2) / cellW), gridCols - 1);
-    const row = Math.min(Math.floor((y + height / 2) / cellH), gridRows - 1);
-    cells[row * gridCols + col].push(c);
+    const col = Math.min(Math.floor((x + width / 2) / cellW), size - 1);
+    const row = Math.min(Math.floor((y + height / 2) / cellH), size - 1);
+    cells[row * size + col].push(c);
   });
 
   const results: Buffer[] = [];

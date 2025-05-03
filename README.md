@@ -1,6 +1,6 @@
 # Sticker GPT
 
-This project monitors notifications on the sora.com website. When new image generations are detected, it downloads the image, splits it into a 3x3 grid (9 parts), and sends the resulting image segments as stickers to a specified Telegram chat. Additionally, it monitors video generations, sending the resulting videos, and provides real-time progress updates for ongoing tasks directly to the Telegram chat.
+This project monitors notifications on the sora.com website. When new image generations are detected, it downloads the image, splits it into a grid (typically 3x3 for 9 parts, but also supports 2x2 for 4 parts), and sends the resulting image segments as stickers to a specified Telegram chat. Additionally, it monitors video generations, sending the resulting videos, and provides real-time progress updates for ongoing tasks directly to the Telegram chat.
 
 ## Prerequisites
 
