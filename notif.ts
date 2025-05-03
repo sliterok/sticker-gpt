@@ -415,13 +415,17 @@ class Notificator {
       const fileName = `${gen.id}.webp`;
       const tempFile = `./temp/${fileName}`;
       await fs.writeFile(tempFile, Buffer.from(buffer));
-      const files = await cropFeatheredStickers(fileName);
-      await fs.unlink(tempFile);
-      for (const file of files || []) {
-        await this.bot.telegram.sendSticker(process.env.CHAT_ID!, {
-          source: file,
-        });
-        await fs.unlink(file);
+      try {
+        const files = await cropFeatheredStickers(fileName);
+        await fs.unlink(tempFile);
+        for (const file of files || []) {
+          await this.bot.telegram.sendSticker(process.env.CHAT_ID!, {
+            source: file,
+          });
+          await fs.unlink(file);
+        }
+      } catch (err) {
+        console.error("Error while sending sticker", err);
       }
     }
   }

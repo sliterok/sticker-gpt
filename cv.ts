@@ -10,17 +10,17 @@ export async function cropFeatheredStickers(
 ) {
   const inputPath = path.join("./temp", fileName);
   let img = cv.imread(inputPath, cv.IMREAD_UNCHANGED);
-
+  if (img.channels !== 4) throw new Error("Need an RGBA PNG");
   // --- fallback for white-background (3-channel) images ---
-  if (img.channels === 3) {
-    const [B, G, R] = img.splitChannels();
-    // white → 255; invert so non-white stays opaque
-    const gray = img.cvtColor(cv.COLOR_BGR2GRAY);
-    const alpha = gray.threshold(254, 255, cv.THRESH_BINARY_INV);
-    img = new cv.Mat([B, G, R, alpha]);
-  } else if (img.channels !== 4) {
-    throw new Error(`Unsupported image format (${img.channels} channels)`);
-  }
+  // if (img.channels === 3) {
+  //   const [B, G, R] = img.splitChannels();
+  //   // white → 255; invert so non-white stays opaque
+  //   const gray = img.cvtColor(cv.COLOR_BGR2GRAY);
+  //   const alpha = gray.threshold(254, 255, cv.THRESH_BINARY_INV);
+  //   img = new cv.Mat([B, G, R, alpha]);
+  // } else if (img.channels !== 4) {
+  //   throw new Error(`Unsupported image format (${img.channels} channels)`);
+  // }
   // --------------------------------------------------------
 
   // build cleaned alpha mask & find contours
