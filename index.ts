@@ -1,13 +1,37 @@
+import { existsSync } from "fs";
+import { mkdir, readdir } from "fs/promises";
 import * as cv from "opencv4nodejs";
 import * as path from "path";
 
+const inputDir = "./input";
+const outputDir = "./output";
+
+async function main() {
+  const files = await readdir(inputDir);
+  for (const file of files) {
+    try {
+      await cropFeatheredStickers(file);
+    } catch (error) {
+      console.error("Error cropping", file, error);
+    }
+  }
+}
+
+main();
+
 async function cropFeatheredStickers(
-  inputPath: string,
-  outputDir: string,
+  fileName: string,
   gridRows = 3,
   gridCols = 3,
   featherPx = 10
 ) {
+  const outputLocation = path.join(
+    outputDir,
+    fileName.replace(/\.\w{3,4}/, "")
+  );
+  if (existsSync(outputLocation)) return;
+
+  const inputPath = path.join(inputDir, fileName);
   const img = cv.imread(inputPath, cv.IMREAD_UNCHANGED);
   if (img.channels !== 4) throw new Error("Need an RGBA PNG");
 
@@ -33,6 +57,7 @@ async function cropFeatheredStickers(
     cells[row * gridCols + col].push(c);
   });
 
+  await mkdir(outputLocation);
   // process each cell
   cells.forEach((cluster, idx) => {
     if (!cluster.length) return;
@@ -82,8 +107,6 @@ async function cropFeatheredStickers(
     // Merge faded colors + blurred α
     const result = new cv.Mat([Bb, Gb, Rb, maskBlur]);
 
-    cv.imwrite(path.join(outputDir, `sticker_${idx + 1}.webp`), result);
+    cv.imwrite(path.join(outputLocation, `${idx + 1}.webp`), result);
   });
 }
-
-cropFeatheredStickers("./test.png", "./out3").catch(console.error);
