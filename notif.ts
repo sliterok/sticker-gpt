@@ -8,8 +8,8 @@ import {
 } from "./types";
 import { Telegraf } from "telegraf";
 import fs from "fs/promises";
-import { headers } from "./fetch";
 import { cropFeatheredStickers } from "./cv";
+import headers from "./headers.json";
 
 class Notificator {
   private lastGenerationTime?: number;
@@ -440,7 +440,7 @@ interface IGetMessageOptions {
 // --- Initialization ---
 
 // Validate essential environment variables before starting
-const requiredEnvVars = ["BOT_TOKEN", "TOKEN", "COOKIE", "CHAT_ID"];
+const requiredEnvVars = ["BOT_TOKEN", "CHAT_ID"];
 const missingEnvVars = requiredEnvVars.filter(
   (varName) => !process.env[varName]
 );
