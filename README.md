@@ -80,18 +80,18 @@ These commands execute the `notif.ts` script using `tsx`, which will begin monit
 
 ## Prompting Guidelines
 
-**Important:** When generating images that you intend to use with this tool, your prompt **must** include either:
+When generating images intended for use with this tool, you have two main options for the background:
 
-- `telegram sticker`
-- `transparent background`
+1.  **Transparent Background (Recommended):** For the most reliable results, include `transparent background` or `telegram sticker` directly in your prompt. This ensures the generated image has an alpha channel, which the sticker creation process handles best.
 
-This is crucial because the image processing script (`cv.ts`) requires images with an alpha channel (transparency). Standard generations have a white background, which will not work correctly for creating stickers with this tool. Specifying this requirement directly in the prompt ensures the generated image has the necessary transparency.
+2.  **Plain White Background (Experimental):** Support for images with a plain white background has been added, but it can be finicky. For this to work correctly, the background must be plain white. Any variations, gradients, or off-white shades might cause issues during sticker processing.
 
-**Note:** Adding these phrases to a _preset_ is not sufficient; include it directly in the prompt text itself.
+**Note:** Adding `transparent background` or `telegram sticker` phrases to a _preset_ is not sufficient; include it directly in the prompt text itself.
+**Using Presets:** You can include the `white background` requirement within a generation preset. This can help streamline your workflow.
 
 ### Example Preset
 
-While the core requirement is the transparency keyword, here's an example structure of a preset you might adapt for generating sticker packs:
+Here's an example structure of a preset you might adapt for generating sticker packs:
 
 ```markdown
 Generate a telegram sticker pack of a subject

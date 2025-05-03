@@ -4,17 +4,45 @@ export async function cropFeatheredStickers(url: string, featherPx = 10) {
   const req = await fetch(url);
   const buffer = await req.arrayBuffer();
   let img = cv.imdecode(Buffer.from(buffer), cv.IMREAD_UNCHANGED);
-  if (img.channels !== 4) throw new Error("Need an RGBA image");
   // --- fallback for white-background (3-channel) images ---
-  // if (img.channels === 3) {
-  //   const [B, G, R] = img.splitChannels();
-  //   // white → 255; invert so non-white stays opaque
-  //   const gray = img.cvtColor(cv.COLOR_BGR2GRAY);
-  //   const alpha = gray.threshold(254, 255, cv.THRESH_BINARY_INV);
-  //   img = new cv.Mat([B, G, R, alpha]);
-  // } else if (img.channels !== 4) {
-  //   throw new Error(`Unsupported image format (${img.channels} channels)`);
-  // }
+  if (img.channels === 3) {
+    const [B, G, R] = img.splitChannels();
+
+    // Use flood fill to detect background from top-left corner
+    // Create a mask slightly larger than the image for floodFill, initialized to 0s
+    const mask = new cv.Mat(img.rows + 2, img.cols + 2, cv.CV_8UC1, 0);
+    // Define color tolerance for flood fill (adjust if needed for different backgrounds)
+    const loDiff = new cv.Vec3(3, 3, 3); // Lower difference tolerance
+    const upDiff = new cv.Vec3(3, 3, 3); // Upper difference tolerance
+    // Flags: FLOODFILL_MASK_ONLY means the function won't change the input image,
+    // only the mask. The (255 << 8) part sets the fill color for the mask to 255.
+    const flags = cv.FLOODFILL_MASK_ONLY | (255 << 8);
+
+    // Flood fill from the top-left corner (0,0)
+    // The function fills the mask where pixels are connected to the seed point (0,0)
+    // and within the color tolerance (loDiff, upDiff) compared to the seed point.
+    img.floodFill(
+      new cv.Point2(0, 0), // seedPoint
+      new cv.Vec3(1, 1, 1), // newVal
+      mask, // mask
+      loDiff, // loDiff
+      upDiff, // upDiff
+      flags // flags
+    );
+
+    // Crop the mask back to original image size (remove the 1px border added for floodFill)
+    const croppedMask = mask.getRegion(new cv.Rect(1, 1, img.cols, img.rows));
+
+    // Invert the mask: background (marked as 255) becomes 0 (transparent),
+    // foreground (originally 0) becomes 255 (opaque).
+    const alpha = croppedMask.threshold(254, 255, cv.THRESH_BINARY_INV);
+
+    // Combine original color channels with the new alpha mask
+    img = new cv.Mat([B, G, R, alpha]);
+  } else if (img.channels !== 4) {
+    // Handle images that are not 3-channel (BGR) or 4-channel (BGRA)
+    throw new Error(`Unsupported image format (${img.channels} channels)`);
+  }
   // --------------------------------------------------------
 
   // build cleaned alpha mask & find contours
