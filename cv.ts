@@ -1,15 +1,14 @@
-import { randomUUID } from "crypto";
 import * as cv from "opencv4nodejs";
-import * as path from "path";
 
 export async function cropFeatheredStickers(
-  fileName: string,
+  url: string,
   gridRows = 3,
   gridCols = 3,
   featherPx = 10
 ) {
-  const inputPath = path.join("./temp", fileName);
-  let img = cv.imread(inputPath, cv.IMREAD_UNCHANGED);
+  const req = await fetch(url);
+  const buffer = await req.arrayBuffer();
+  let img = cv.imdecode(Buffer.from(buffer), cv.IMREAD_UNCHANGED);
   if (img.channels !== 4) throw new Error("Need an RGBA image");
   // --- fallback for white-background (3-channel) images ---
   // if (img.channels === 3) {
@@ -46,7 +45,7 @@ export async function cropFeatheredStickers(
     cells[row * gridCols + col].push(c);
   });
 
-  const results: string[] = [];
+  const results: Buffer[] = [];
   cells.forEach((cluster, idx) => {
     if (!cluster.length) return;
     // union-rect
@@ -86,9 +85,7 @@ export async function cropFeatheredStickers(
 
     // 4) merge your faded colors + the blurred alpha
     const result = new cv.Mat([Bf, Gf, Rf, maskBlur]);
-    const outputFile = path.join("./temp", `${randomUUID()}.webp`);
-    results.push(outputFile);
-    cv.imwrite(outputFile, result);
+    results.push(cv.imencode(".webp", result));
   });
 
   return results;

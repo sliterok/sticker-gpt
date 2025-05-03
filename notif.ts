@@ -410,19 +410,12 @@ class Notificator {
   private async sendStickers(generations: IGeneration[]) {
     // Send images as stickers
     for (const gen of generations) {
-      const req = await fetch(gen.encodings.source.path);
-      const buffer = await req.arrayBuffer();
-      const fileName = `${gen.id}.webp`;
-      const tempFile = `./temp/${fileName}`;
-      await fs.writeFile(tempFile, Buffer.from(buffer));
       try {
-        const files = await cropFeatheredStickers(fileName);
-        await fs.unlink(tempFile);
-        for (const file of files || []) {
+        const images = await cropFeatheredStickers(gen.encodings.source.path);
+        for (const source of images || []) {
           await this.bot.telegram.sendSticker(process.env.CHAT_ID!, {
-            source: file,
+            source,
           });
-          await fs.unlink(file);
         }
       } catch (err) {
         console.error("Error while sending sticker", err);
