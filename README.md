@@ -86,7 +86,7 @@ When generating images intended for use with this tool, you have two main option
 
 2.  **Plain White Background (Experimental):** Support for images with a plain white background has been added, but it can be finicky. For this to work correctly, the background must be plain white. Any variations, gradients, or off-white shades might cause issues during sticker processing.
 
-**Note:** Adding `transparent background` or `telegram sticker` phrases to a _preset_ is not sufficient; include it directly in the prompt text itself.
+**Note:** Adding `transparent background` or `telegram sticker` phrases to a _preset_ is not sufficient; include it directly in the prompt text itself.  
 **Using Presets:** You can include the `white background` requirement within a generation preset. This can help streamline your workflow.
 
 ### Example Preset
