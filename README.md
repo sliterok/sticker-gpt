@@ -50,7 +50,7 @@ Before you begin, ensure you have the following installed:
 4.  **Configure Notification Headers:**
     Create a `headers.json` file in the root directory. This file must contain the necessary HTTP request headers required to interact with the sora.com `/backend/notif` endpoint.
 
-    - **How to obtain headers:** Use your browser's developer tools (usually by pressing F12). Go to the Network tab, perform the action on sora.com that triggers the notification check, find the request to `/backend/notif`, and copy the request headers into the `headers.json` file.
+    - **How to obtain headers:** Use your browser's developer tools (usually by pressing F12). Go to the Network tab, perform the action on sora.com that triggers the notification check, find the request to `/backend/notif`, press Copy > Copy as fetch (Node.js), and copy the value of `headers` property into the `headers.json` file.
 
     - **Example `headers.json` format:**
       ```json
