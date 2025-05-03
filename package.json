@@ -17,6 +17,8 @@
   },
   "dependencies": {
     "@u4/opencv4nodejs": "^7.1.2",
-    "opencv4nodejs": "^5.6.0"
+    "dotenv": "^16.5.0",
+    "opencv4nodejs": "^5.6.0",
+    "telegraf": "^4.16.3"
   }
 }

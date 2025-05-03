@@ -1,3 +1,6 @@
 *.webp
 *.png
+*.json
+temp
 node_modules
+.env

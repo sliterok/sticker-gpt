@@ -1,39 +1,27 @@
-import { existsSync } from "fs";
-import { mkdir, readdir } from "fs/promises";
+import { randomUUID } from "crypto";
 import * as cv from "opencv4nodejs";
 import * as path from "path";
 
-const inputDir = "./input";
-const outputDir = "./output";
-
-async function main() {
-  const files = await readdir(inputDir);
-  for (const file of files) {
-    try {
-      await cropFeatheredStickers(file);
-    } catch (error) {
-      console.error("Error cropping", file, error);
-    }
-  }
-}
-
-main();
-
-async function cropFeatheredStickers(
+export async function cropFeatheredStickers(
   fileName: string,
   gridRows = 3,
   gridCols = 3,
   featherPx = 10
 ) {
-  const outputLocation = path.join(
-    outputDir,
-    fileName.replace(/\.\w{3,4}/, "")
-  );
-  if (existsSync(outputLocation)) return;
+  const inputPath = path.join("./temp", fileName);
+  let img = cv.imread(inputPath, cv.IMREAD_UNCHANGED);
 
-  const inputPath = path.join(inputDir, fileName);
-  const img = cv.imread(inputPath, cv.IMREAD_UNCHANGED);
-  if (img.channels !== 4) throw new Error("Need an RGBA PNG");
+  // --- fallback for white-background (3-channel) images ---
+  if (img.channels === 3) {
+    const [B, G, R] = img.splitChannels();
+    // white → 255; invert so non-white stays opaque
+    const gray = img.cvtColor(cv.COLOR_BGR2GRAY);
+    const alpha = gray.threshold(254, 255, cv.THRESH_BINARY_INV);
+    img = new cv.Mat([B, G, R, alpha]);
+  } else if (img.channels !== 4) {
+    throw new Error(`Unsupported image format (${img.channels} channels)`);
+  }
+  // --------------------------------------------------------
 
   // build cleaned alpha mask & find contours
   const alpha = img.splitChannels()[3];
@@ -50,6 +38,7 @@ async function cropFeatheredStickers(
   const cells: cv.Contour[][] = Array(gridRows * gridCols)
     .fill(0)
     .map(() => []);
+
   contours.forEach((c) => {
     const { x, y, width, height } = c.boundingRect();
     const col = Math.min(Math.floor((x + width / 2) / cellW), gridCols - 1);
@@ -57,11 +46,10 @@ async function cropFeatheredStickers(
     cells[row * gridCols + col].push(c);
   });
 
-  await mkdir(outputLocation);
-  // process each cell
+  const results: string[] = [];
   cells.forEach((cluster, idx) => {
     if (!cluster.length) return;
-    // union‐rect
+    // union-rect
     const rects = cluster.map((c) => c.boundingRect());
     const x0 = Math.min(...rects.map((r) => r.x));
     const y0 = Math.min(...rects.map((r) => r.y));
@@ -81,32 +69,26 @@ async function cropFeatheredStickers(
 
     // 2) feather the mask
     const k = featherPx * 2 + 1;
-    const maskBlur = mask.gaussianBlur(new cv.Size(k, k), 0); // … after you’ve built maskBlur …
+    const maskBlur = mask.gaussianBlur(new cv.Size(k, k), 0);
 
     // Normalize blurred α to [0…1]
     const maskF = maskBlur.convertTo(cv.CV_32FC1, 1 / 255);
 
     // Split RGBA crop
-    const [B, G, R, A] = crop.splitChannels();
+    const [B2, G2, R2] = crop.splitChannels();
+    const Af = maskBlur; // blurred alpha
 
-    // Convert color channels to float
-    const Bf = B.convertTo(cv.CV_32FC1);
-    const Gf = G.convertTo(cv.CV_32FC1);
-    const Rf = R.convertTo(cv.CV_32FC1);
-
-    // Element-wise multiply by maskF to fade edges
-    const Bm = Bf.hMul(maskF);
-    const Gm = Gf.hMul(maskF);
-    const Rm = Rf.hMul(maskF);
-
-    // Back to 8-bit
-    const Bb = Bm.convertTo(cv.CV_8UC1);
-    const Gb = Gm.convertTo(cv.CV_8UC1);
-    const Rb = Rm.convertTo(cv.CV_8UC1);
+    // Fade edges
+    const Bf = B2.convertTo(cv.CV_32FC1).hMul(maskF).convertTo(cv.CV_8UC1);
+    const Gf = G2.convertTo(cv.CV_32FC1).hMul(maskF).convertTo(cv.CV_8UC1);
+    const Rf = R2.convertTo(cv.CV_32FC1).hMul(maskF).convertTo(cv.CV_8UC1);
 
     // Merge faded colors + blurred α
-    const result = new cv.Mat([Bb, Gb, Rb, maskBlur]);
-
-    cv.imwrite(path.join(outputLocation, `${idx + 1}.webp`), result);
+    const result = new cv.Mat([Bf, Gf, Rf, Af]);
+    const outputFile = path.join("./temp", `${randomUUID()}.webp`);
+    results.push(outputFile);
+    cv.imwrite(outputFile, result);
   });
+
+  return results;
 }
