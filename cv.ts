@@ -10,7 +10,7 @@ export async function cropFeatheredStickers(
 ) {
   const inputPath = path.join("./temp", fileName);
   let img = cv.imread(inputPath, cv.IMREAD_UNCHANGED);
-  if (img.channels !== 4) throw new Error("Need an RGBA PNG");
+  if (img.channels !== 4) throw new Error("Need an RGBA image");
   // --- fallback for white-background (3-channel) images ---
   // if (img.channels === 3) {
   //   const [B, G, R] = img.splitChannels();
@@ -60,31 +60,32 @@ export async function cropFeatheredStickers(
     const region = new cv.Rect(x0, y0, w, h);
     const crop = img.getRegion(region);
 
-    // 1) build binary mask of this sticker
-    const mask = new cv.Mat(h, w, cv.CV_8UC1, 0);
-    cluster.forEach((c) => {
-      const pts = c.getPoints().map((p) => new cv.Point2(p.x - x0, p.y - y0));
-      mask.drawFillPoly([pts], new cv.Vec3(255, 255, 255));
-    });
+    // 1) build binary mask from the crop's own alpha channel (preserves holes!)
+    const channels = crop.splitChannels();
+    const alphaCrop = channels[3];
+    const maskBin = alphaCrop.threshold(1, 255, cv.THRESH_BINARY);
 
-    // 2) feather the mask
+    // optional: clean up tiny speckles
+    const cleanMask = maskBin.morphologyEx(
+      cv.getStructuringElement(cv.MORPH_ELLIPSE, new cv.Size(5, 5)),
+      cv.MORPH_OPEN
+    );
+
+    // 2) feather it
     const k = featherPx * 2 + 1;
-    const maskBlur = mask.gaussianBlur(new cv.Size(k, k), 0);
+    const maskBlur = cleanMask.gaussianBlur(new cv.Size(k, k), 0);
 
-    // Normalize blurred α to [0…1]
+    // normalized float mask for color multiplication
     const maskF = maskBlur.convertTo(cv.CV_32FC1, 1 / 255);
 
-    // Split RGBA crop
-    const [B2, G2, R2] = crop.splitChannels();
-    const Af = maskBlur; // blurred alpha
-
-    // Fade edges
+    // 3) apply to each color channel
+    const [B2, G2, R2] = channels;
     const Bf = B2.convertTo(cv.CV_32FC1).hMul(maskF).convertTo(cv.CV_8UC1);
     const Gf = G2.convertTo(cv.CV_32FC1).hMul(maskF).convertTo(cv.CV_8UC1);
     const Rf = R2.convertTo(cv.CV_32FC1).hMul(maskF).convertTo(cv.CV_8UC1);
 
-    // Merge faded colors + blurred α
-    const result = new cv.Mat([Bf, Gf, Rf, Af]);
+    // 4) merge your faded colors + the blurred alpha
+    const result = new cv.Mat([Bf, Gf, Rf, maskBlur]);
     const outputFile = path.join("./temp", `${randomUUID()}.webp`);
     results.push(outputFile);
     cv.imwrite(outputFile, result);
