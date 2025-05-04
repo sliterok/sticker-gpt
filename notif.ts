@@ -1,4 +1,8 @@
 import "dotenv/config";
+import { Telegraf, Input, TelegramError } from "telegraf";
+import fs from "fs/promises";
+import path from "path";
+import { type } from "os";
 import {
   IGeneration,
   IPayload,
@@ -6,74 +10,141 @@ import {
   TaskStatus,
   TaskType,
 } from "./types";
-import { Telegraf } from "telegraf";
-import fs from "fs/promises";
 import { cropFeatheredStickers } from "./cv";
 import headers from "./headers.json";
 
+// --- Constants ---
+const LAST_ID_FILE_PATH = path.join(__dirname, "last.json"); // Use __dirname for robustness
+const API_BASE_URL = "https://sora.com/backend/notif";
+const FETCH_LIMIT = 100;
+const MIN_FETCH_INTERVAL_SECONDS = 5;
+const DEFAULT_INTERVALS = {
+  QUEUED: 15,
+  RUNNING: 10,
+  RECENT_GENERATION: 25, // < 2 mins
+  MEDIUM_TERM_GENERATION: 50, // < 5 mins
+  LONG_TERM_GENERATION: 120, // < 30 mins
+  IDLE: 600, // > 30 mins
+};
+
+// --- Interfaces ---
+interface IGetMessageOptions {
+  linkUrl?: string;
+  linkText?: string;
+  suffix?: string;
+}
+
+// --- Notificator Class ---
 class Notificator {
+  private bot: Telegraf;
+  private lastId?: string;
   private lastGenerationTime?: number;
-  private lastId?: string; // Initialize as potentially undefined
-  private status?: TaskStatus; // Initialize as potentially undefined
-  private progressMessageId?: number;
+  private status?: TaskStatus;
   private progress?: number;
-  private bot = new Telegraf(process.env.BOT_TOKEN!);
-  private isFetching = false; // Prevent concurrent fetches
+  private progressMessageId?: number;
+  private isFetching = false;
+  private fetchTimeoutId?: NodeJS.Timeout;
+  private readonly chatId: string;
 
   constructor() {
-    this.readLastId().then(() => {
-      this.getNotifications();
-    });
+    const botToken = process.env.BOT_TOKEN;
+    this.chatId = process.env.CHAT_ID!; // Already validated
+
+    if (!botToken) {
+      console.error("BOT_TOKEN environment variable is missing!");
+      process.exit(1);
+    }
+    this.bot = new Telegraf(botToken);
+
+    this.initialize();
   }
 
-  private async readLastId() {
+  private async initialize(): Promise<void> {
+    await this.readLastId();
+    this.fetchAndProcessNotifications();
+    this.setupShutdownHandlers();
+  }
+
+  // --- State Management ---
+
+  private async readLastId(): Promise<void> {
     try {
-      // Use a constant for the filename
-      const filePath = "./last.json";
-      const file = await fs.readFile(filePath, "utf8");
+      const file = await fs.readFile(LAST_ID_FILE_PATH, "utf8");
       const data = JSON.parse(file);
-      // Ensure lastId is a string or undefined
       this.lastId = typeof data === "string" ? data : undefined;
-      console.log(`Read lastId: ${this.lastId}`);
+      console.log(`Read lastId: ${this.lastId ?? "None"}`);
     } catch (error: any) {
-      // If file doesn't exist (ENOENT), it's okay, just start fresh.
       if (error.code === "ENOENT") {
-        console.log("last.json not found, starting fresh.");
-        this.lastId = undefined;
+        console.log(`${LAST_ID_FILE_PATH} not found, starting fresh.`);
       } else {
-        // For other errors (parsing, permissions), log a warning.
         console.warn(
-          "Could not read or parse last.json, starting fresh.",
-          error
+          `Could not read or parse ${LAST_ID_FILE_PATH}, starting fresh. Error: ${error.message}`
         );
-        this.lastId = undefined;
       }
+      this.lastId = undefined;
     }
   }
 
-  private async setLastId(id: string) {
+  private async setLastId(id: string): Promise<void> {
+    if (id === this.lastId) return; // Avoid unnecessary writes
     try {
-      // Use a constant for the filename
-      const filePath = "./last.json";
-      await fs.writeFile(filePath, JSON.stringify(id), "utf8");
+      await fs.writeFile(LAST_ID_FILE_PATH, JSON.stringify(id), "utf8");
       this.lastId = id;
       console.log(`Persisted new lastId: ${id}`);
     } catch (error) {
-      console.error("Failed to write last.json:", error);
-      // Decide if we should retry or handle this failure case
+      console.error(`Failed to write ${LAST_ID_FILE_PATH}:`, error);
+      // Consider retry logic or alternative handling if persistence is critical
     }
   }
 
-  private scheduleNextFetch() {
-    // Ensure fetch isn't scheduled multiple times if already running
-    if (this.isFetching) return;
-    const interval = this.getNextInterval();
-    console.log(`Scheduling next fetch in ${interval} seconds.`);
-    // Use a timeout handle if needed to clear it on shutdown
-    setTimeout(() => this.getNotifications(), interval * 1000);
+  // --- Fetching Logic ---
+
+  private scheduleNextFetch(): void {
+    if (this.fetchTimeoutId) {
+      clearTimeout(this.fetchTimeoutId); // Clear existing timeout
+    }
+    if (this.isFetching) return; // Don't schedule if already fetching
+
+    const intervalSeconds = this.getNextInterval();
+    console.log(`Scheduling next fetch in ${intervalSeconds} seconds.`);
+    this.fetchTimeoutId = setTimeout(
+      () => this.fetchAndProcessNotifications(),
+      intervalSeconds * 1000
+    );
   }
 
-  async getNotifications() {
+  private getNextInterval(): number {
+    let interval: number;
+
+    switch (this.status) {
+      case TaskStatus.queued:
+        interval = DEFAULT_INTERVALS.QUEUED;
+        break;
+      case TaskStatus.running:
+        interval = DEFAULT_INTERVALS.RUNNING;
+        break;
+      default: // succeeded, failed, or undefined
+        interval = this.getIdleInterval();
+    }
+    // Optional: Add jitter
+    // interval += Math.random() * 2 - 1; // +/- 1 second
+    return Math.max(MIN_FETCH_INTERVAL_SECONDS, interval);
+  }
+
+  private getIdleInterval(): number {
+    const secondsSinceLastGen = this.lastGenerationTime
+      ? (Date.now() - this.lastGenerationTime) / 1000
+      : Infinity;
+
+    if (secondsSinceLastGen < 120) return DEFAULT_INTERVALS.RECENT_GENERATION;
+    if (secondsSinceLastGen < 300)
+      return DEFAULT_INTERVALS.MEDIUM_TERM_GENERATION;
+    if (secondsSinceLastGen < 1800)
+      return DEFAULT_INTERVALS.LONG_TERM_GENERATION;
+    return DEFAULT_INTERVALS.IDLE;
+  }
+
+  private async fetchAndProcessNotifications(): Promise<void> {
     if (this.isFetching) {
       console.log("Fetch already in progress, skipping.");
       return;
@@ -82,241 +153,332 @@ class Notificator {
     console.log(`Fetching notifications... (using lastId: ${this.lastId})`);
 
     try {
-      const params = [`limit=5`];
-      // Only add 'before' if lastId is defined and not an empty string
-      if (this.lastId) {
-        params.push(`before=${this.lastId}`);
-      }
+      const response = await this.fetchNotifications();
+      if (!response) return; // Error handled in fetchNotifications
 
-      const apiUrl = `https://sora.com/backend/notif?${params.join("&")}`;
-      console.log(`Requesting URL: ${apiUrl}`);
-
-      const req = await fetch(apiUrl, {
-        headers,
-      });
-
-      if (!req.ok) {
-        // Log response body for debugging if possible
-        const errorBody = await req
-          .text()
-          .catch(() => "Could not read error body");
-        throw new Error(
-          `API request failed with status ${req.status}. Body: ${errorBody}`
-        );
-      }
-
-      const res: IResponse = await req.json();
-
-      if (res.last_id === null) {
-        console.log("No new notifications.");
+      if (!this.isValidResponse(response)) {
+        console.warn("Received invalid response structure:", response);
         return;
       }
 
-      // Validate the response structure
-      if (!res || !Array.isArray(res.data) || typeof res.last_id !== "string") {
-        console.warn(
-          "Received invalid response structure:",
-          JSON.stringify(res)
-        );
-        // Don't schedule next fetch immediately, let the finally block handle it
+      if (response.data.length === 0) {
+        console.log("No new notifications found.");
+        // Handle potential progress update even with no new *items*
+        // Check if the API's last_id matches our current one and has progress info
+        // This scenario seems less likely with the current API structure, but good to consider
+        // await this.handlePotentialProgressWithoutNewItems(response);
         return;
       }
 
       console.log(
-        `Received ${res.data.length} notifications. API's last_id: ${res.last_id}`
+        `Processing ${response.data.length} new notifications. API's last_id: ${response.last_id}`
       );
+      await this.processNotifications(response);
 
-      if (res.data.length === 0) {
-        console.log("No new notifications found.");
-        // Update status based on the API's last_id if it matches ours and handle progress message
-        const latestPayload = res.data.find(
-          (el) => el.payload.id === res.last_id
-        )?.payload;
-        if (latestPayload && latestPayload.id === this.lastId) {
-          await this.handleProgressUpdate(latestPayload);
-        } else {
-          // If no relevant payload, ensure progress message is cleared if it exists
-          await this.clearProgressMessageIfNeeded(undefined); // Pass undefined status
-        }
-        return; // Nothing new to process
-      }
-
-      console.log(`Processing ${res.data.length} new notifications.`);
-
-      // Process notifications. Assuming API returns newest first.
-      // Process them in reverse order (oldest new notification first)
-      // so that if processing stops midway, lastId is set to the last *successfully* processed one.
-      const notificationsToProcess = res.data.slice().reverse();
-      let latestSuccessfullyProcessedId = this.lastId; // Start with current lastId
-      this.lastGenerationTime = Date.now();
-
-      for (const item of notificationsToProcess) {
-        const payload = item.payload;
-        console.log(
-          `Processing notification ID: ${payload.id}, Status: ${payload.status}`
-        );
-
-        // Only process and send notifications for *succeeded* tasks
-        if (payload.status === TaskStatus.succeeded) {
-          console.log(
-            `Task ${payload.id} succeeded. Attempting to send notification...`
-          );
-          try {
-            if (
-              payload.type === TaskType.imageGen &&
-              payload.generations?.length
-            ) {
-              await this.sendStickers(payload.generations);
-            } else if (
-              payload.type === TaskType.videoGen &&
-              payload.generations?.length
-            ) {
-              // Send videos as a media group
-              const mediaGroup = payload.generations
-                .map((gen) => {
-                  if (gen.url) {
-                    return {
-                      type: "video" as const, // Explicit type
-                      media: {
-                        url: gen.url,
-                        filename:
-                          (gen.title || payload.title || payload.id) + ".mp4",
-                      },
-                      caption: this.getMessage(payload, {
-                        linkText: gen.title || payload.title, // Use generation title or fallback
-                        linkUrl: gen.url, // Link to the specific video
-                      }),
-                      parse_mode: "HTML" as const,
-                    };
-                  }
-                  console.warn(
-                    `Missing video URL for generation in task ${payload.id}`
-                  );
-                  return null; // Filter out missing URLs
-                })
-                .filter(Boolean); // Remove null entries
-
-              if (mediaGroup.length > 0) {
-                await this.bot.telegram.sendMediaGroup(
-                  process.env.CHAT_ID!,
-                  mediaGroup as any
-                ); // Type assertion needed for complex type
-              } else {
-                console.warn(
-                  `No valid video URLs found to send for task ${payload.id}`
-                );
-              }
-            } else {
-              console.log(
-                `Task ${payload.id} succeeded but type is ${payload.type} or no generations found. Skipping send.`
-              );
-            }
-
-            // If sending was successful (or skipped appropriately), update the latest processed ID
-            latestSuccessfullyProcessedId = payload.id;
-            console.log(
-              `Successfully processed notification for ${payload.id}. Updated latestSuccessfullyProcessedId to ${latestSuccessfullyProcessedId}.`
-            );
-
-            // Clear any progress message after sending the final result
-            await this.clearProgressMessageIfNeeded(payload.status);
-          } catch (sendError) {
-            console.error(
-              `Failed to send notification for ${payload.id}:`,
-              sendError
-            );
-            // Stop processing further notifications in this batch on send error
-            // to avoid skipping over a failed one and incorrectly updating lastId.
-            console.log(
-              `Stopping processing for this batch due to send error for ${payload.id}. lastId remains ${this.lastId}.`
-            );
-            return; // Exit the getNotifications function
-          }
-        } else {
-          console.log(
-            `Task ${payload.id} status is ${payload.status}. Skipping send, will handle progress update later.`
-          );
-          // Keep track of the ID even if not 'succeeded' for potential progress updates
-          // latestSuccessfullyProcessedId = payload.id; // No, only update for SUCCEEDED
-        }
-      } // End of loop through notificationsToProcess
-
-      // Persist the very latest ID that was successfully processed
-      if (
-        latestSuccessfullyProcessedId &&
-        latestSuccessfullyProcessedId !== this.lastId
-      ) {
-        await this.setLastId(latestSuccessfullyProcessedId);
-      }
-
-      // After processing all new items, handle progress update based on the *most recent* item overall from the API response
-      // This ensures we show progress for the absolute latest task, even if older ones were processed.
-      const absoluteLatestPayload = res.data[0]?.payload; // API returns newest first
+      // Update status and handle progress based on the *absolute latest* item from the API
+      const absoluteLatestPayload = response.data[0]?.payload; // API returns newest first
       if (absoluteLatestPayload) {
         await this.handleProgressUpdate(absoluteLatestPayload);
+      } else {
+        // If somehow data exists but payload doesn't, clear progress
+        await this.clearProgressMessageIfNeeded(undefined);
       }
     } catch (error) {
       console.error("Error during notification fetch/processing:", error);
-      // Consider more robust error handling (e.g., exponential backoff on certain errors)
+      // Consider more specific error handling (e.g., network vs. processing errors)
     } finally {
       this.isFetching = false;
-      // Always schedule the next fetch, even if errors occurred.
-      this.scheduleNextFetch();
+      this.scheduleNextFetch(); // Always schedule the next attempt
     }
   }
 
-  private async handleProgressUpdate(payload: IPayload) {
-    this.status = payload.status; // Update overall status based on this payload
+  private async fetchNotifications(): Promise<IResponse | null> {
+    const params = new URLSearchParams({ limit: String(FETCH_LIMIT) });
+    if (this.lastId) {
+      params.append("before", this.lastId);
+    }
 
-    if (this.status === TaskStatus.running && payload.progress_pct != null) {
-      // Check for null/undefined progress
+    const apiUrl = `${API_BASE_URL}?${params.toString()}`;
+    console.log(`Requesting URL: ${apiUrl}`);
+
+    try {
+      const req = await fetch(apiUrl, { headers });
+
+      if (!req.ok) {
+        const errorBody = await req
+          .text()
+          .catch(() => "Could not read error body");
+        console.error(
+          `API request failed: ${req.status} ${req.statusText}. URL: ${apiUrl}. Body: ${errorBody}`
+        );
+        return null; // Indicate failure
+      }
+
+      return (await req.json()) as IResponse;
+    } catch (networkError) {
+      console.error(`Network error fetching notifications: ${networkError}`);
+      return null; // Indicate failure
+    }
+  }
+
+  private isValidResponse(res: any): res is IResponse {
+    return (
+      res &&
+      typeof res === "object" &&
+      Array.isArray(res.data) &&
+      (typeof res.last_id === "string" || res.last_id === null) // Allow null last_id
+    );
+  }
+
+  // --- Processing Logic ---
+
+  private async processNotifications(response: IResponse): Promise<void> {
+    // Process notifications in reverse order (oldest new first)
+    const notificationsToProcess = response.data.slice().reverse();
+    let latestSuccessfullyProcessedId = this.lastId; // Start with current
+
+    for (const item of notificationsToProcess) {
+      const payload = item.payload;
+      if (!payload) {
+        console.warn("Notification item missing payload:", item);
+        continue; // Skip this item
+      }
+
+      console.log(
+        `Processing notification ID: ${payload.id}, Status: ${payload.status}`
+      );
+
+      if (payload.status === TaskStatus.succeeded) {
+        const success = await this.handleSucceededTask(payload);
+        if (success) {
+          latestSuccessfullyProcessedId = payload.id;
+          this.lastGenerationTime = Date.now(); // Update time on successful processing
+          console.log(
+            `Successfully processed notification for ${payload.id}. Updated latestSuccessfullyProcessedId to ${latestSuccessfullyProcessedId}.`
+          );
+          // Clear progress after successful send
+          await this.clearProgressMessageIfNeeded(payload.status);
+        } else {
+          // If sending failed, stop processing this batch to avoid skipping
+          console.log(
+            `Stopping processing for this batch due to send error for ${payload.id}. lastId remains ${this.lastId}.`
+          );
+          return; // Exit processing loop
+        }
+      } else {
+        console.log(
+          `Task ${payload.id} status is ${payload.status}. Skipping send notification.`
+        );
+        // We still might need to update progress based on this later
+      }
+    } // End of loop
+
+    // Persist the latest successfully processed ID *after* the loop
+    if (
+      latestSuccessfullyProcessedId &&
+      latestSuccessfullyProcessedId !== this.lastId
+    ) {
+      await this.setLastId(latestSuccessfullyProcessedId);
+    }
+  }
+
+  private async handleSucceededTask(payload: IPayload): Promise<boolean> {
+    console.log(
+      `Task ${payload.id} succeeded. Attempting to send notification...`
+    );
+    try {
+      if (payload.type === TaskType.imageGen && payload.generations?.length) {
+        await this.sendStickers(payload.generations);
+      } else if (
+        payload.type === TaskType.videoGen &&
+        payload.generations?.length
+      ) {
+        await this.sendVideos(payload);
+      } else {
+        console.log(
+          `Task ${payload.id} succeeded but type is ${payload.type} or no generations found. Skipping send.`
+        );
+      }
+      return true; // Indicate success (or skipped appropriately)
+    } catch (sendError) {
+      console.error(
+        `Failed to send notification for ${payload.id}:`,
+        sendError
+      );
+      return false; // Indicate failure
+    }
+  }
+
+  // --- Sending Logic ---
+
+  /**
+   * Sends a Telegram API request with automatic retry logic for rate limiting (429 errors).
+   * @param method The Telegraf API method to call (e.g., this.bot.telegram.sendSticker).
+   * @param args The arguments to pass to the API method.
+   * @param context A description for logging purposes (e.g., "sticker for gen X").
+   * @returns The result of the API call if successful.
+   * @throws Throws an error if the request fails after all retries or for non-rate-limit reasons.
+   */
+  private async sendWithRetry<T extends (...args: any[]) => Promise<any>>(
+    method: T,
+    args: Parameters<T>,
+    context: string
+  ): Promise<Awaited<ReturnType<T>>> {
+    const MAX_RETRIES = 5;
+    let retries = 0;
+
+    while (retries < MAX_RETRIES) {
+      try {
+        // Bind the method to the correct context (this.bot.telegram)
+        const boundMethod = method.bind(this.bot.telegram);
+        return await boundMethod(...args);
+      } catch (err) {
+        if (
+          err instanceof TelegramError &&
+          err.response?.error_code === 429 &&
+          err.response.parameters?.retry_after
+        ) {
+          const retryAfter = err.response.parameters.retry_after;
+          const waitMs = (retryAfter + 1) * 1000; // Add 1 second buffer
+          retries++;
+          console.warn(
+            `Rate limit hit (429) sending ${context}. Retry ${retries}/${MAX_RETRIES} after ${
+              waitMs / 1000
+            }s.`
+          );
+          if (retries >= MAX_RETRIES) {
+            console.error(`Max retries reached for ${context}. Giving up.`);
+            throw new Error(
+              `Failed to send ${context} after ${MAX_RETRIES} retries due to rate limiting.`
+            );
+          }
+          await new Promise((resolve) => setTimeout(resolve, waitMs));
+        } else {
+          // Handle other errors (network, invalid arguments, etc.)
+          console.error(`Error sending ${context}:`, err);
+          throw err; // Re-throw other errors immediately
+        }
+      }
+    }
+    // This part should theoretically not be reached if MAX_RETRIES > 0
+    throw new Error(`Failed to send ${context} after exhausting retries.`);
+  }
+
+  private async sendStickers(generations: IGeneration[]): Promise<void> {
+    for (const gen of generations) {
+      if (!gen.encodings?.source?.path) {
+        console.warn(
+          `Skipping sticker for generation ${gen.id}: Missing source path.`
+        );
+        continue;
+      }
+
+      let imageBuffers: Buffer[] | null = null;
+      try {
+        imageBuffers = await cropFeatheredStickers(gen.encodings.source.path);
+      } catch (cropError) {
+        console.error(
+          `Error cropping sticker for generation ${gen.id} from path ${gen.encodings.source.path}:`,
+          cropError
+        );
+        continue; // Skip this generation if cropping fails
+      }
+
+      if (!imageBuffers || imageBuffers.length === 0) {
+        console.warn(
+          `No stickers generated from source path: ${gen.encodings.source.path}`
+        );
+        continue;
+      }
+
+      for (const source of imageBuffers) {
+        try {
+          await this.sendWithRetry(
+            this.bot.telegram.sendSticker,
+            [this.chatId, { source }],
+            `sticker for gen ${gen.id}`
+          );
+        } catch (sendError) {
+          console.error(
+            `Failed to send sticker for gen ${gen.id} after retries: ${sendError}`
+          );
+          // Decide if one failure should stop all stickers for this generation
+          // break; // Uncomment to stop processing stickers for the current generation on failure
+        }
+      } // end for loop (stickers)
+    } // end for loop (generations)
+  }
+
+  private async sendVideos(payload: IPayload): Promise<void> {
+    const mediaGroup = (payload.generations ?? [])
+      .map((gen) => {
+        if (gen.url) {
+          return {
+            type: "video" as const,
+            media: {
+              url: gen.url,
+              filename: `${gen.title || payload.title || payload.id}.mp4`,
+            },
+            // Caption removed as per previous request
+          };
+        }
+        console.warn(`Missing video URL for generation in task ${payload.id}`);
+        return null;
+      })
+      .filter((item): item is NonNullable<typeof item> => item !== null); // Type guard
+
+    if (mediaGroup.length === 0) {
+      console.warn(`No valid video URLs found to send for task ${payload.id}`);
+      return;
+    }
+
+    console.log(
+      `Attempting to send ${mediaGroup.length} videos for task ${payload.id}`
+    );
+    // TODO: Implement splitting into multiple groups if mediaGroup.length > 10
+
+    try {
+      await this.sendWithRetry(
+        this.bot.telegram.sendMediaGroup,
+        [this.chatId, mediaGroup],
+        `video group for task ${payload.id}`
+      );
+      console.log(`Successfully sent video group for task ${payload.id}`);
+    } catch (sendError) {
+      console.error(
+        `Failed to send video group for task ${payload.id} after retries: ${sendError}`
+      );
+      // Decide if this failure should prevent the lastId from updating
+      // Throwing an error here will propagate up and cause handleSucceededTask to return false
+      throw sendError;
+    }
+  }
+
+  // --- Progress Handling ---
+
+  private async handleProgressUpdate(payload: IPayload): Promise<void> {
+    this.status = payload.status; // Update overall status
+
+    if (
+      this.status === TaskStatus.running &&
+      payload.progress_pct != null // Check for null/undefined
+    ) {
       const progress = Math.round(payload.progress_pct * 100);
 
-      // Only update if progress changed or message doesn't exist
-      if (this.progress !== progress || !this.progressMessageId) {
+      // Only update if progress changed significantly or message doesn't exist
+      if (
+        !this.progressMessageId ||
+        !this.progress ||
+        Math.abs(this.progress - progress) >= 1 // Update if changed by >= 1%
+      ) {
         this.progress = progress;
         const text = this.getMessage(payload, { suffix: `${progress}%` });
         console.log(`Updating progress for ${payload.id}: ${progress}%`);
 
         if (this.progressMessageId) {
-          try {
-            await this.bot.telegram.editMessageText(
-              process.env.CHAT_ID!,
-              this.progressMessageId,
-              undefined, // inline_message_id
-              text,
-              { parse_mode: "HTML" }
-            );
-          } catch (editError: any) {
-            // If message expired or not found (400), send a new one
-            if (
-              editError.response?.error_code === 400 &&
-              editError.description?.includes("message to edit not found")
-            ) {
-              console.warn(
-                "Failed to edit progress message (likely deleted/expired), sending new one."
-              );
-              delete this.progressMessageId; // Reset ID
-              const message = await this.bot.telegram.sendMessage(
-                process.env.CHAT_ID!,
-                text,
-                { parse_mode: "HTML", disable_notification: true }
-              );
-              this.progressMessageId = message.message_id;
-            } else {
-              console.error("Failed to edit progress message:", editError);
-              // Consider deleting the message ID if edit fails persistently
-              // delete this.progressMessageId;
-            }
-          }
+          await this.editProgressMessage(text);
         } else {
-          // Send initial progress message
-          const message = await this.bot.telegram.sendMessage(
-            process.env.CHAT_ID!,
-            text,
-            { parse_mode: "HTML", disable_notification: true }
-          );
-          this.progressMessageId = message.message_id;
+          await this.sendNewProgressMessage(text);
         }
       }
     } else {
@@ -325,21 +487,72 @@ class Notificator {
     }
   }
 
-  private async clearProgressMessageIfNeeded(currentStatus?: TaskStatus) {
-    // Clear progress if message exists and status is not 'running'
-    if (this.progressMessageId && currentStatus !== TaskStatus.running) {
+  private async editProgressMessage(text: string): Promise<void> {
+    if (!this.progressMessageId) return;
+    try {
+      await this.bot.telegram.editMessageText(
+        this.chatId,
+        this.progressMessageId,
+        undefined, // inline_message_id
+        text,
+        { parse_mode: "HTML" }
+      );
+    } catch (editError: any) {
+      if (
+        editError.response?.error_code === 400 &&
+        (editError.description?.includes("message to edit not found") ||
+          editError.description?.includes("message is not modified"))
+      ) {
+        console.warn(
+          `Failed to edit progress message (not found or not modified), sending new one. Error: ${editError.description}`
+        );
+        delete this.progressMessageId; // Reset ID
+        await this.sendNewProgressMessage(text); // Send fresh
+      } else {
+        console.error("Failed to edit progress message:", editError);
+        // Consider deleting the message ID if edit fails persistently?
+        // delete this.progressMessageId;
+      }
+    }
+  }
+
+  private async sendNewProgressMessage(text: string): Promise<void> {
+    try {
+      const message = await this.bot.telegram.sendMessage(this.chatId, text, {
+        parse_mode: "HTML",
+        disable_notification: true, // Keep progress updates silent
+      });
+      this.progressMessageId = message.message_id;
+      console.log(`Sent new progress message (ID: ${this.progressMessageId})`);
+    } catch (sendError) {
+      console.error("Failed to send new progress message:", sendError);
+      // Reset progress state if sending fails
+      delete this.progressMessageId;
+      delete this.progress;
+    }
+  }
+
+  private async clearProgressMessageIfNeeded(
+    currentStatus?: TaskStatus
+  ): Promise<void> {
+    // Clear if message exists AND status is terminal (succeeded, failed) or undefined
+    const isTerminalStatus =
+      currentStatus &&
+      currentStatus !== TaskStatus.running &&
+      currentStatus !== TaskStatus.queued;
+
+    if (this.progressMessageId && (isTerminalStatus || !currentStatus)) {
       console.log(
         `Task status is ${
-          currentStatus || "not running"
+          currentStatus || "finished/undefined"
         }. Deleting progress message (ID: ${this.progressMessageId}).`
       );
       try {
         await this.bot.telegram.deleteMessage(
-          process.env.CHAT_ID!,
+          this.chatId,
           this.progressMessageId
         );
       } catch (deleteError: any) {
-        // Ignore if message is already deleted (400 error)
         if (
           !(
             deleteError.response?.error_code === 400 &&
@@ -359,106 +572,62 @@ class Notificator {
     }
   }
 
-  private getNextInterval() {
-    let interval;
+  // --- Helpers ---
 
-    switch (this.status) {
-      case TaskStatus.queued:
-        interval = 15; // 15 seconds
-        break;
-      case TaskStatus.running:
-        interval = 10; // 10 seconds
-        break;
-      default:
-        interval = this.getDefaultNextInterval();
-      // Add cases for failed, etc. if different intervals are desired
-      // case TaskStatus.failed:
-      //   interval = 60; // Check less often after failure?
-      //   break;
-    }
-    // Add some jitter to avoid thundering herd
-    // interval += Math.random() * 2 - 1; // +/- 1 second
-    return Math.max(5, interval); // Ensure minimum interval (e.g., 5 seconds)
-  }
-
-  private getDefaultNextInterval() {
-    const secondsSinceLastGen =
-      (Date.now() - (this.lastGenerationTime || 0)) / 1000;
-
-    if (secondsSinceLastGen < 120) return 25;
-    else if (secondsSinceLastGen < 300) return 50;
-    else if (secondsSinceLastGen < 1800) return 120;
-    else return 600;
-  }
-
-  private getMessage(payload: IPayload, opts: IGetMessageOptions) {
-    // Construct the base URL for the task
+  private getMessage(payload: IPayload, opts: IGetMessageOptions): string {
     const baseUrl = `https://sora.com/t/${payload.id}`;
-    // Use the specific generation URL if provided, otherwise fallback to task URL
     const url = opts.linkUrl || baseUrl;
-    // Use generation title, then task title, then a generic fallback
     const linkText = opts?.linkText || payload.title || `Task ${payload.id}`;
-    // Escape HTML entities in linkText to prevent injection issues if title contains HTML
-    const escapedLinkText = linkText.replace(/</g, "<").replace(/>/g, ">");
+    // Basic HTML escaping for link text
+    const escapedLinkText = linkText
+      .replace(/&/g, "&")
+      .replace(/</g, "<")
+      .replace(/>/g, ">");
 
     const link = `<a href="${url}">${escapedLinkText}</a>`;
-
-    // Add suffix if provided
     return opts.suffix ? `${link} ${opts.suffix}` : link;
   }
 
-  private async sendStickers(generations: IGeneration[]) {
-    // Send images as stickers
-    for (const gen of generations) {
-      try {
-        const images = await cropFeatheredStickers(gen.encodings.source.path);
-        for (const source of images || []) {
-          await this.bot.telegram.sendSticker(process.env.CHAT_ID!, {
-            source,
-          });
-        }
-      } catch (err) {
-        console.error("Error while sending sticker", err);
-      }
-    }
-  }
-}
+  // --- Lifecycle ---
 
-interface IGetMessageOptions {
-  linkUrl?: string; // URL specific to the generation (video/image)
-  linkText?: string; // Text for the link (generation title or task title)
-  suffix?: string; // Optional suffix (e.g., progress percentage)
+  private setupShutdownHandlers(): void {
+    const shutdown = (signal: string) => {
+      console.log(`Received ${signal}. Shutting down gracefully...`);
+      if (this.fetchTimeoutId) {
+        clearTimeout(this.fetchTimeoutId);
+      }
+      // Add any other cleanup logic here (e.g., close DB connections)
+      console.log("Shutdown complete.");
+      process.exit(0);
+    };
+
+    process.once("SIGINT", () => shutdown("SIGINT"));
+    process.once("SIGTERM", () => shutdown("SIGTERM"));
+  }
 }
 
 // --- Initialization ---
 
-// Validate essential environment variables before starting
-const requiredEnvVars = ["BOT_TOKEN", "CHAT_ID"];
-const missingEnvVars = requiredEnvVars.filter(
-  (varName) => !process.env[varName]
-);
-
-if (missingEnvVars.length > 0) {
-  console.error(
-    `Missing required environment variables: ${missingEnvVars.join(
-      ", "
-    )}. Exiting.`
+function validateEnvVariables(): boolean {
+  const requiredEnvVars = ["BOT_TOKEN", "CHAT_ID"];
+  const missingEnvVars = requiredEnvVars.filter(
+    (varName) => !process.env[varName]
   );
-  process.exit(1); // Exit with error code
+
+  if (missingEnvVars.length > 0) {
+    console.error(
+      `Missing required environment variables: ${missingEnvVars.join(
+        ", "
+      )}. Exiting.`
+    );
+    return false;
+  }
+  return true;
 }
 
-// Start the notificator
-console.log("Starting Sora Notificator...");
-new Notificator();
-
-// Optional: Add graceful shutdown handling
-process.once("SIGINT", () => {
-  console.log("Received SIGINT. Shutting down...");
-  // Add any cleanup logic here if needed (e.g., clear timeouts)
-  process.exit(0);
-});
-process.once("SIGTERM", () => {
-  console.log("Received SIGTERM. Shutting down...");
-  // Add any cleanup logic here
-  process.exit(0);
-});
+if (validateEnvVariables()) {
+  console.log("Starting Sora Notificator...");
+  new Notificator();
+} else {
+  process.exit(1);
+}
