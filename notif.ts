@@ -15,7 +15,7 @@ import headers from "./headers.json";
 
 // --- Constants ---
 const LAST_ID_FILE_PATH = path.join(__dirname, "last.json"); // Use __dirname for robustness
-const API_BASE_URL = "https://sora.com/backend/notif";
+const API_BASE_URL = "https://sora.chatgpt.com/backend/notif";
 const FETCH_LIMIT = 100;
 const MIN_FETCH_INTERVAL_SECONDS = 5;
 const DEFAULT_INTERVALS = {
